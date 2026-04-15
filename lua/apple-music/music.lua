@@ -32,45 +32,54 @@ local WATCHER_SRC = PLUGIN_ROOT .. "/bin/music-watcher.swift"
 
 local function bin_is_stale()
 	local bin_stat = vim.uv.fs_stat(WATCHER_BIN)
-	if not bin_stat then return true end
+	if not bin_stat then
+		return true
+	end
 	local src_stat = vim.uv.fs_stat(WATCHER_SRC)
-	if not src_stat then return false end
+	if not src_stat then
+		return false
+	end
 	return src_stat.mtime.sec > bin_stat.mtime.sec
-		or (src_stat.mtime.sec == bin_stat.mtime.sec
-			and src_stat.mtime.nsec > bin_stat.mtime.nsec)
+		or (src_stat.mtime.sec == bin_stat.mtime.sec and src_stat.mtime.nsec > bin_stat.mtime.nsec)
 end
 
 local function recompile(on_done)
 	vim.notify("apple-music.nvim: recompiling watcher…", vim.log.levels.INFO, { title = " Apple Music" })
 	local stderr = vim.uv.new_pipe(false)
 	local err_buf = ""
-	vim.uv.spawn("swiftc", {
-		args     = { WATCHER_SRC, "-o", WATCHER_BIN },
-		env      = nil,
-		cwd      = nil,
-		uid      = nil,
-		gid      = nil,
-		verbatim = false,
-		detached = false,
-		hide     = false,
-		stdio    = { nil, nil, stderr },
-	}, vim.schedule_wrap(function(code, _signal)
-		stderr:read_stop()
-		stderr:close()
-		if code == 0 then
-			vim.notify("apple-music.nvim: watcher compiled OK", vim.log.levels.INFO, { title = " Apple Music" })
-			on_done(true)
-		else
-			vim.notify(
-				"apple-music.nvim: compilation failed:\n" .. err_buf,
-				vim.log.levels.ERROR,
-				{ title = " Apple Music" }
-			)
-			on_done(false)
-		end
-	end))
+	vim.uv.spawn(
+		"swiftc",
+		{
+			args = { WATCHER_SRC, "-o", WATCHER_BIN },
+			env = nil,
+			cwd = nil,
+			uid = nil,
+			gid = nil,
+			verbatim = false,
+			detached = false,
+			hide = false,
+			stdio = { nil, nil, stderr },
+		},
+		vim.schedule_wrap(function(code, _signal)
+			stderr:read_stop()
+			stderr:close()
+			if code == 0 then
+				vim.notify("apple-music.nvim: watcher compiled OK", vim.log.levels.INFO, { title = " Apple Music" })
+				on_done(true)
+			else
+				vim.notify(
+					"apple-music.nvim: compilation failed:\n" .. err_buf,
+					vim.log.levels.ERROR,
+					{ title = " Apple Music" }
+				)
+				on_done(false)
+			end
+		end)
+	)
 	stderr:read_start(function(_err, data)
-		if data then err_buf = err_buf .. data end
+		if data then
+			err_buf = err_buf .. data
+		end
 	end)
 end
 
@@ -148,7 +157,9 @@ local function stop_watcher()
 end
 
 local function start_watcher()
-	if _proc then return end
+	if _proc then
+		return
+	end
 
 	if vim.fn.executable("swiftc") == 0 then
 		vim.notify(
@@ -161,7 +172,9 @@ local function start_watcher()
 
 	if bin_is_stale() then
 		recompile(function(ok)
-			if ok then start_watcher() end
+			if ok then
+				start_watcher()
+			end
 		end)
 		return
 	end
@@ -169,15 +182,15 @@ local function start_watcher()
 	_stdout = vim.uv.new_pipe(false)
 
 	local handle, err = vim.uv.spawn(WATCHER_BIN, {
-		args     = {},
-		env      = nil,
-		cwd      = nil,
-		uid      = nil,
-		gid      = nil,
+		args = {},
+		env = nil,
+		cwd = nil,
+		uid = nil,
+		gid = nil,
 		verbatim = false,
 		detached = false,
-		hide     = false,
-		stdio    = { nil, _stdout, nil },
+		hide = false,
+		stdio = { nil, _stdout, nil },
 	}, function(_code, _signal)
 		stop_watcher()
 	end)
@@ -215,7 +228,7 @@ function M.nowplaying()
 	if s.status == "playing" and s.title ~= "" then
 		local label = s.title
 		if s.artist ~= "" then
-			label = label .. "  " .. s.artist
+			label = "♫ " .. label .. " - " .. s.artist
 		end
 		if #label > 48 then
 			label = label:sub(1, 45) .. "…"
