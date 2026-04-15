@@ -1,7 +1,3 @@
---- apple-music/statusline.lua
---- Provides a ready-made component string for staline.nvim (and any other
---- statusline plugin that accepts a function or evaluated expression).
-
 local M = {}
 local music = require("apple-music.music")
 

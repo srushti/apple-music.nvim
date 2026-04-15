@@ -18,9 +18,10 @@ A lightweight Neovim plugin that connects to **Apple Music** running locally on 
 
 | Requirement | Notes |
 |---|---|
-| macOS | Uses `osascript` to talk to Music.app |
+| macOS | Uses `NSDistributedNotificationCenter` + `osascript` to talk to Music.app |
 | Neovim ≥ 0.10 | Uses `vim.uv` (libuv bindings) |
 | Apple Music | Must be installed (comes with macOS) |
+| Xcode Command Line Tools | Needed once to compile the watcher binary (`swiftc`) |
 
 ---
 
@@ -99,10 +100,29 @@ am.stop_timer()   -- stop background polling
 
 ## How it works
 
-All macOS integration is done via `osascript` through Neovim's `vim.fn.system()`.  
-A `vim.uv.new_timer()` fires every 5 s on a background loop, caches the result, and calls `redrawstatus!` so the statusline updates without any user interaction.
+On **macOS**, `setup()` / `start_timer()` does two things:
 
-The Music.app process-existence check (`System Events`) is performed before every fetch to avoid accidentally launching the app.
+1. **Initial sync** — one `osascript` call fetches the current player state so the statusline is correct immediately on startup.
+2. **Event-driven watcher** — a small compiled Swift binary (`bin/music-watcher`) is spawned as a background process. It subscribes to `NSDistributedNotificationCenter` for `com.apple.Music.playerInfo`, the notification Apple Music posts on every track change and play/pause toggle. Each event is written to the process's stdout as a JSON line; Neovim reads it via a `vim.uv` pipe and updates the cache instantly — no polling, no timer.
+
+On **non-macOS** all public functions are no-ops and nothing is started.
+
+### Building the watcher binary
+
+The binary only needs to be compiled once (or after updating the plugin):
+
+```sh
+cd ~/.local/share/nvim/lazy/apple-music.nvim
+swiftc bin/music-watcher.swift -o bin/music-watcher
+```
+
+If `swiftc` is not found, install the Xcode Command Line Tools:
+
+```sh
+xcode-select --install
+```
+
+> The compiled binary is intentionally `.gitignore`-d; each machine compiles it locally.
 
 ---
 

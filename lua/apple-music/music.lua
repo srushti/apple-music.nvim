@@ -1,9 +1,23 @@
---- apple-music/music.lua
---- AppleScript bridge: queries Apple Music state via osascript.
-
 local M = {}
 
--- Cached state so the statusline never blocks on a slow system call.
+if vim.fn.has("mac") == 0 and vim.fn.has("macunix") == 0 then
+	local noop = function() end
+	M._cache = {}
+	M.nowplaying = function()
+		return ""
+	end
+	M.state = function()
+		return {}
+	end
+	M.refresh = noop
+	M.play_pause = noop
+	M.next_track = noop
+	M.prev_track = noop
+	M.start_timer = noop
+	M.stop_timer = noop
+	return M
+end
+
 M._cache = {
 	status = "not_running", -- "playing" | "paused" | "stopped" | "not_running"
 	title = "",
@@ -12,12 +26,54 @@ M._cache = {
 	updated = 0,
 }
 
-local TTL_ACTIVE_MS = 20 * 1000 -- 20 s while Music is running
-local TTL_IDLE_MS = 60 * 1000 -- 1 min while Music is not running
+local PLUGIN_ROOT = debug.getinfo(1, "S").source:sub(2):match("^(.*)/lua/")
+local WATCHER_BIN = PLUGIN_ROOT .. "/bin/music-watcher"
+local WATCHER_SRC = PLUGIN_ROOT .. "/bin/music-watcher.swift"
 
--- ---------------------------------------------------------------------------
--- Internal: run an AppleScript snippet and return trimmed stdout.
--- ---------------------------------------------------------------------------
+local function bin_is_stale()
+	local bin_stat = vim.uv.fs_stat(WATCHER_BIN)
+	if not bin_stat then return true end
+	local src_stat = vim.uv.fs_stat(WATCHER_SRC)
+	if not src_stat then return false end
+	return src_stat.mtime.sec > bin_stat.mtime.sec
+		or (src_stat.mtime.sec == bin_stat.mtime.sec
+			and src_stat.mtime.nsec > bin_stat.mtime.nsec)
+end
+
+local function recompile(on_done)
+	vim.notify("apple-music.nvim: recompiling watcher…", vim.log.levels.INFO, { title = " Apple Music" })
+	local stderr = vim.uv.new_pipe(false)
+	local err_buf = ""
+	vim.uv.spawn("swiftc", {
+		args     = { WATCHER_SRC, "-o", WATCHER_BIN },
+		env      = nil,
+		cwd      = nil,
+		uid      = nil,
+		gid      = nil,
+		verbatim = false,
+		detached = false,
+		hide     = false,
+		stdio    = { nil, nil, stderr },
+	}, vim.schedule_wrap(function(code, _signal)
+		stderr:read_stop()
+		stderr:close()
+		if code == 0 then
+			vim.notify("apple-music.nvim: watcher compiled OK", vim.log.levels.INFO, { title = " Apple Music" })
+			on_done(true)
+		else
+			vim.notify(
+				"apple-music.nvim: compilation failed:\n" .. err_buf,
+				vim.log.levels.ERROR,
+				{ title = " Apple Music" }
+			)
+			on_done(false)
+		end
+	end))
+	stderr:read_start(function(_err, data)
+		if data then err_buf = err_buf .. data end
+	end)
+end
+
 local function applescript(script)
 	local result = vim.fn.system({ "osascript", "-e", script })
 	if vim.v.shell_error ~= 0 then
@@ -26,11 +82,6 @@ local function applescript(script)
 	return vim.trim(result)
 end
 
--- ---------------------------------------------------------------------------
--- Internal: fetch fresh data from Apple Music.
--- Returns true on success, false if Music is not running / unavailable.
--- All info is retrieved in a single osascript call to minimise latency.
--- ---------------------------------------------------------------------------
 local function fetch()
 	local script = [[
 		tell application "System Events"
@@ -58,85 +109,137 @@ local function fetch()
 		M._cache.title = ""
 		M._cache.artist = ""
 		M._cache.album = ""
-		return false
+		return
 	end
 
-	-- Parse the tab-delimited response: state\ttitle\tartist\talbum
 	local parts = vim.split(raw, "\t", { plain = true })
-	local state = parts[1] or "stopped"
-	M._cache.status = state
+	M._cache.status = parts[1] or "stopped"
 	M._cache.title = parts[2] or ""
 	M._cache.artist = parts[3] or ""
 	M._cache.album = parts[4] or ""
-	-- true = Music is running (even if stopped/paused), false = not running at all.
-	return state ~= "not_running"
+	M._cache.updated = vim.uv.now()
 end
 
--- Returns the appropriate TTL based on whether Music is running.
-local function current_ttl()
-	local s = M._cache.status
-	return (s == "playing" or s == "paused" or s == "stopped") and TTL_ACTIVE_MS or TTL_IDLE_MS
+local function apply_event(obj)
+	M._cache.status = obj.status or "stopped"
+	M._cache.title = obj.title or ""
+	M._cache.artist = obj.artist or ""
+	M._cache.album = obj.album or ""
+	M._cache.updated = vim.uv.now()
+	vim.cmd("redrawstatus!")
 end
 
--- ---------------------------------------------------------------------------
--- Internal: refresh cache if TTL has expired.
--- ---------------------------------------------------------------------------
-local function maybe_refresh()
-	local now = vim.uv.now()
-	if (now - M._cache.updated) >= current_ttl() then
-		fetch()
-		M._cache.updated = vim.uv.now()
+local _proc = nil
+local _stdout = nil
+local _buf = "" -- accumulate partial lines
+
+local function stop_watcher()
+	if _stdout then
+		_stdout:read_stop()
+		_stdout:close()
+		_stdout = nil
 	end
+	if _proc then
+		_proc:kill("sigterm")
+		_proc:close()
+		_proc = nil
+	end
+	_buf = ""
 end
 
--- ---------------------------------------------------------------------------
--- Public: return a compact "now playing" string for the statusline.
--- Returns "" when nothing is playing or Music is not running.
--- ---------------------------------------------------------------------------
+local function start_watcher()
+	if _proc then return end
+
+	if vim.fn.executable("swiftc") == 0 then
+		vim.notify(
+			"apple-music.nvim: swiftc not found — install Xcode Command Line Tools:\n  xcode-select --install",
+			vim.log.levels.WARN,
+			{ title = " Apple Music" }
+		)
+		return
+	end
+
+	if bin_is_stale() then
+		recompile(function(ok)
+			if ok then start_watcher() end
+		end)
+		return
+	end
+
+	_stdout = vim.uv.new_pipe(false)
+
+	local handle, err = vim.uv.spawn(WATCHER_BIN, {
+		args     = {},
+		env      = nil,
+		cwd      = nil,
+		uid      = nil,
+		gid      = nil,
+		verbatim = false,
+		detached = false,
+		hide     = false,
+		stdio    = { nil, _stdout, nil },
+	}, function(_code, _signal)
+		stop_watcher()
+	end)
+
+	if not handle then
+		vim.notify(
+			"apple-music.nvim: failed to spawn watcher: " .. (err or "unknown"),
+			vim.log.levels.ERROR,
+			{ title = " Apple Music" }
+		)
+		_stdout:close()
+		_stdout = nil
+		return
+	end
+
+	_proc = handle
+
+	_stdout:read_start(vim.schedule_wrap(function(_read_err, data)
+		if _read_err or not data then
+			return
+		end
+		_buf = _buf .. data
+		for line in _buf:gmatch("([^\n]+)\n") do
+			local ok, obj = pcall(vim.json.decode, line)
+			if ok and type(obj) == "table" then
+				apply_event(obj)
+			end
+		end
+		_buf = _buf:match("[^\n]*$") or ""
+	end))
+end
+
 function M.nowplaying()
-	maybe_refresh()
 	local s = M._cache
 	if s.status == "playing" and s.title ~= "" then
-		local icon = " "
 		local label = s.title
 		if s.artist ~= "" then
 			label = label .. "  " .. s.artist
 		end
-		-- Truncate to keep the statusline tidy.
 		if #label > 48 then
 			label = label:sub(1, 45) .. "…"
 		end
-		return icon .. label
+		return " " .. label
 	elseif s.status == "paused" and s.title ~= "" then
-		local icon = " "
 		local label = s.title
 		if #label > 30 then
 			label = label:sub(1, 27) .. "…"
 		end
-		return icon .. label
+		return " " .. label
 	end
 	return ""
 end
 
--- ---------------------------------------------------------------------------
--- Public: return the raw cache table (title, artist, album, status).
--- ---------------------------------------------------------------------------
 function M.state()
-	maybe_refresh()
 	return vim.deepcopy(M._cache)
 end
 
--- ---------------------------------------------------------------------------
--- Public: force an immediate refresh (bypasses TTL).
--- ---------------------------------------------------------------------------
 function M.refresh()
 	fetch()
-	M._cache.updated = vim.uv.now()
+	vim.cmd("redrawstatus!")
 end
 
--- ---------------------------------------------------------------------------
--- Control commands
--- ---------------------------------------------------------------------------
 function M.play_pause()
 	applescript('tell application "Music" to playpause')
 	vim.defer_fn(M.refresh, 300)
@@ -152,53 +255,13 @@ function M.prev_track()
 	vim.defer_fn(M.refresh, 300)
 end
 
--- ---------------------------------------------------------------------------
--- Background timer: keeps the cache warm so statusline reads are instant.
--- Restarts itself with the correct interval when the running state changes.
--- ---------------------------------------------------------------------------
-local _timer = nil
-local _timer_interval = nil -- tracks the interval the timer was started with
-
 function M.start_timer()
-	if _timer then
-		return
-	end
-	local interval = current_ttl()
-	_timer_interval = interval
-	_timer = vim.uv.new_timer()
-	_timer:start(
-		0,
-		interval,
-		vim.schedule_wrap(function()
-			fetch()
-			M._cache.updated = vim.uv.now()
-			-- Restart the timer if the TTL bucket has changed (running ↔ not running).
-			local new_interval = current_ttl()
-			if new_interval ~= _timer_interval then
-				_timer:stop()
-				_timer_interval = new_interval
-				_timer:start(
-					new_interval,
-					new_interval,
-					vim.schedule_wrap(function()
-						fetch()
-						M._cache.updated = vim.uv.now()
-						vim.cmd("redrawstatus!")
-					end)
-				)
-			end
-			-- Redraw the statusline without moving the cursor.
-			vim.cmd("redrawstatus!")
-		end)
-	)
+	fetch()
+	start_watcher()
 end
 
 function M.stop_timer()
-	if _timer then
-		_timer:stop()
-		_timer:close()
-		_timer = nil
-	end
+	stop_watcher()
 end
 
 return M
