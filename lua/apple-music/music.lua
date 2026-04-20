@@ -13,6 +13,8 @@ if vim.fn.has("mac") == 0 and vim.fn.has("macunix") == 0 then
 	M.play_pause = noop
 	M.next_track = noop
 	M.prev_track = noop
+	M.toggle_favourite = noop
+	M.on_track_change = noop
 	M.start_timer = noop
 	M.stop_timer = noop
 	return M
@@ -129,12 +131,30 @@ local function fetch()
 	M._cache.updated = vim.uv.now()
 end
 
+local _on_track_change_cbs = {}
+
+--- Register a callback to be called whenever a new track starts playing.
+--- The callback receives a table: { title, artist, album }
+function M.on_track_change(cb)
+	table.insert(_on_track_change_cbs, cb)
+end
+
 local function apply_event(obj)
+	local prev_title = M._cache.title
 	M._cache.status = obj.status or "stopped"
 	M._cache.title = obj.title or ""
 	M._cache.artist = obj.artist or ""
 	M._cache.album = obj.album or ""
 	M._cache.updated = vim.uv.now()
+
+	-- Fire track-change callbacks when a new song starts playing
+	if M._cache.status == "playing" and M._cache.title ~= "" and M._cache.title ~= prev_title then
+		local info = { title = M._cache.title, artist = M._cache.artist, album = M._cache.album }
+		for _, cb in ipairs(_on_track_change_cbs) do
+			cb(info)
+		end
+	end
+
 	vim.cmd("redrawstatus!")
 end
 
@@ -266,6 +286,29 @@ end
 function M.prev_track()
 	applescript('tell application "Music" to previous track')
 	vim.defer_fn(M.refresh, 300)
+end
+
+function M.toggle_favourite()
+	local script = [[
+		tell application "System Events"
+			set isRunning to (name of processes) contains "Music"
+		end tell
+		if not isRunning then return "not_running" end if
+		tell application "Music"
+			if player state is playing or player state is paused then
+				set loved of current track to not (loved of current track)
+				return loved of current track as string
+			end if
+		end tell
+	]]
+	local result = applescript(script)
+	if result == "true" then
+		vim.notify("Loved ♥", vim.log.levels.INFO, { title = " Apple Music" })
+	elseif result == "false" then
+		vim.notify("Unloved ♡", vim.log.levels.INFO, { title = " Apple Music" })
+	else
+		vim.notify("No track is currently playing", vim.log.levels.WARN, { title = " Apple Music" })
+	end
 end
 
 function M.start_timer()

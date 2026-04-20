@@ -4,7 +4,7 @@ local music = require("apple-music.music")
 
 M.config = {
 	auto_start = true,
-	notify_track = false,
+	notify_track = true,
 }
 
 function M.setup(opts)
@@ -42,23 +42,21 @@ function M.setup(opts)
 		end
 	end, { desc = "Apple Music: show now-playing info" })
 
+	vim.api.nvim_create_user_command("AppleMusicToggleFavourite", function()
+		music.toggle_favourite()
+	end, { desc = "Apple Music: toggle favourite (loved) on current track" })
+
 	if M.config.notify_track then
-		local last_title = ""
-		local group = vim.api.nvim_create_augroup("AppleMusicNotify", { clear = true })
-		vim.api.nvim_create_autocmd({ "FocusGained", "CursorHold" }, {
-			group = group,
-			callback = function()
-				local s = music.state()
-				if s.title ~= last_title and s.title ~= "" then
-					last_title = s.title
-					vim.notify(
-						string.format(" %s  —  %s", s.title, s.artist),
-						vim.log.levels.INFO,
-						{ title = " Now Playing" }
-					)
-				end
-			end,
-		})
+		music.on_track_change(function(info)
+			local lines = { "♫  " .. info.title }
+			if info.artist ~= "" then
+				table.insert(lines, "  " .. info.artist)
+			end
+			if info.album ~= "" then
+				table.insert(lines, "  " .. info.album)
+			end
+			vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = " Now Playing" })
+		end)
 	end
 
 	if M.config.auto_start then
@@ -72,6 +70,8 @@ M.refresh = music.refresh
 M.play_pause = music.play_pause
 M.next_track = music.next_track
 M.prev_track = music.prev_track
+M.toggle_favourite = music.toggle_favourite
+M.on_track_change = music.on_track_change
 M.start_timer = music.start_timer
 M.stop_timer = music.stop_timer
 
